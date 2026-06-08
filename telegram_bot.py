@@ -36,7 +36,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from agent import run_agent, build_briefing, build_digest, MODEL, _button_payloads
+from agent import run_agent, build_briefing, build_evening_briefing, build_digest, MODEL, _button_payloads
 import memory as _memory
 import weather as _weather
 from tools import (
@@ -942,21 +942,22 @@ def _briefing_header(date_keyword: str) -> str:
 
 async def _send_briefing(bot, date_keyword: str,
                          chat_id: int | None = None) -> None:
+    """Morning briefing (09:00 / /briefing today)."""
     target = chat_id if chat_id is not None else ALLOWED_USER_ID
     header = _briefing_header(date_keyword)
-    log.info("Sending briefing: %s → chat %d", header, target)
+    log.info("Sending morning briefing: %s → chat %d", header, target)
     try:
         loop = asyncio.get_running_loop()
         body = await loop.run_in_executor(
             _executor,
-            lambda: build_briefing(date_keyword, lang="en"),
+            lambda: build_briefing(date_keyword, lang="en", chat_id=target),
         )
         text = f"{header}\n{'─' * 30}\n\n{body}"
         for chunk in _split_message(text):
             await bot.send_message(chat_id=target, text=chunk)
-        log.info("Briefing sent: %s", header)
+        log.info("Morning briefing sent: %s", header)
     except Exception as exc:
-        log.exception("Briefing failed: %s", header)
+        log.exception("Morning briefing failed: %s", header)
         try:
             await bot.send_message(
                 chat_id=target,
@@ -964,6 +965,30 @@ async def _send_briefing(bot, date_keyword: str,
             )
         except Exception:
             log.exception("Could not deliver briefing failure notice to chat %d", target)
+
+
+async def _send_evening_briefing(bot, chat_id: int | None = None) -> None:
+    """Evening briefing (23:00 / /briefing tomorrow) — accomplishments + tomorrow preview."""
+    target = chat_id if chat_id is not None else ALLOWED_USER_ID
+    log.info("Sending evening briefing → chat %d", target)
+    try:
+        loop = asyncio.get_running_loop()
+        text = await loop.run_in_executor(
+            _executor,
+            lambda: build_evening_briefing(chat_id=target),
+        )
+        for chunk in _split_message(text):
+            await bot.send_message(chat_id=target, text=chunk)
+        log.info("Evening briefing sent → chat %d", target)
+    except Exception as exc:
+        log.exception("Evening briefing failed")
+        try:
+            await bot.send_message(
+                chat_id=target,
+                text=f"⚠️ Evening briefing failed:\n{type(exc).__name__}: {exc}",
+            )
+        except Exception:
+            log.exception("Could not deliver evening briefing failure notice to chat %d", target)
 
 
 # ── Background scheduler loop ─────────────────────────────────────────────────
@@ -984,6 +1009,7 @@ async def _fire_due_reminders(bot) -> None:
 
 
 async def _send_digest(bot) -> None:
+    """On-demand /digest command handler — today's accomplishments only."""
     loop = asyncio.get_running_loop()
     try:
         text = await loop.run_in_executor(_executor, build_digest)
@@ -998,15 +1024,22 @@ async def _scheduler_loop(bot) -> None:
     while True:
         now = datetime.datetime.now(tz=_LOCAL_TZ)
 
-        # Collect all scheduled fire times (briefings + digest)
+        # Scheduled fire times: 09:00 morning, 23:00 evening, 21:00 digest
         candidates: list[tuple[datetime.datetime, str]] = []
 
-        for hour, minute, date_kw in _BRIEFING_SCHEDULE:
-            t = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if t <= now:
-                t += datetime.timedelta(days=1)
-            candidates.append((t, f"briefing:{date_kw}"))
+        # 09:00 — morning briefing (today)
+        morning_t = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        if morning_t <= now:
+            morning_t += datetime.timedelta(days=1)
+        candidates.append((morning_t, "briefing:today"))
 
+        # 23:00 — evening briefing (accomplishments + tomorrow)
+        evening_t = now.replace(hour=23, minute=0, second=0, microsecond=0)
+        if evening_t <= now:
+            evening_t += datetime.timedelta(days=1)
+        candidates.append((evening_t, "evening"))
+
+        # 21:00 — digest (kept as a separate lighter push)
         digest_t = now.replace(hour=_DIGEST_HOUR, minute=_DIGEST_MINUTE,
                                second=0, microsecond=0)
         if digest_t <= now:
@@ -1030,9 +1063,10 @@ async def _scheduler_loop(bot) -> None:
 
         now_after = datetime.datetime.now(tz=_LOCAL_TZ)
         if now_after >= next_fire:
-            if next_kind.startswith("briefing:"):
-                date_kw = next_kind.split(":", 1)[1]
-                await _send_briefing(bot, date_kw)
+            if next_kind == "briefing:today":
+                await _send_briefing(bot, "today")
+            elif next_kind == "evening":
+                await _send_evening_briefing(bot)
             elif next_kind == "digest":
                 await _send_digest(bot)
 
@@ -1128,13 +1162,23 @@ _HELP_TOPICS: dict[str, str] = {
     "briefings": (
         "🌅 <b>Briefings</b>\n\n"
         "<b>Automatic schedule:</b>\n"
-        "  09:00 — morning briefing (today's events + tasks + weather)\n"
-        "  23:00 — evening preview (tomorrow's events + tasks)\n\n"
+        "  09:00 — morning briefing\n"
+        "    • Weather for your default city\n"
+        "    • Today's calendar events\n"
+        "    • Today's tasks (overdue flagged 🔴, due-today 🟡, upcoming 📌)\n"
+        "    • Today's reminders\n"
+        "    • Empty-day nudge if nothing scheduled but tasks are overdue\n\n"
+        "  23:00 — evening briefing\n"
+        "    • Today's accomplishments (completed tasks + events)\n"
+        "    • Tomorrow's calendar events\n"
+        "    • Tomorrow's tasks\n"
+        "    • Tomorrow's reminders\n"
+        "    • Tomorrow's weather forecast\n\n"
+        "  21:00 — short digest (completed tasks + today's events)\n\n"
         "<b>Manual trigger:</b>\n"
-        "  /briefing today    — today's briefing right now\n"
-        "  /briefing tomorrow — tomorrow's briefing right now\n\n"
-        "<b>Content:</b> calendar events, tasks grouped by urgency "
-        "(overdue / due today / upcoming), weather for your configured city."
+        "  /briefing today    — morning format on demand\n"
+        "  /briefing tomorrow — evening format on demand\n\n"
+        "<b>Graceful failure:</b> if one section can't load, the rest still sends."
     ),
 
     "digest": (
@@ -1142,7 +1186,8 @@ _HELP_TOPICS: dict[str, str] = {
         "<b>Automatic:</b> sent every day at 21:00.\n\n"
         "<b>Manual trigger:</b>\n"
         "  /digest  — today's accomplishment digest right now\n\n"
-        "<b>Content:</b> tasks completed today + calendar events that happened today."
+        "<b>Content:</b> tasks completed today + calendar events that happened today.\n\n"
+        "For a full evening briefing (accomplishments + tomorrow preview), use /briefing tomorrow."
     ),
 
     "memory": (
@@ -1163,7 +1208,7 @@ _HELP_TOPICS: dict[str, str] = {
     "weather": (
         "🌤 <b>Weather</b>\n\n"
         "<b>Commands:</b>\n"
-        "  /weather                    — current default city (set in .env or via setdefault)\n"
+        "  /weather                    — current default city\n"
         "  /weather &lt;city&gt;           — one-off query for any city\n"
         "  /weather setdefault &lt;city&gt; — save a new default city\n\n"
         "<b>Examples:</b>\n"
@@ -1263,8 +1308,8 @@ _HELP_TOPICS: dict[str, str] = {
 _HELP_OVERVIEW_LINES: list[tuple[str, str]] = [
     ("calendar",  "📅 Calendar   — events, reminders, delete-with-confirm"),
     ("tasks",     "✅ Tasks      — add/complete/update, list per task-list"),
-    ("briefings", "🌅 Briefings  — auto 09:00 morning + 23:00 preview"),
-    ("digest",    "🌙 Digest     — auto 21:00 daily accomplishments"),
+    ("briefings", "🌅 Briefings  — 09:00 morning + 23:00 evening + 21:00 digest"),
+    ("digest",    "🌙 Digest     — /digest on-demand, auto 21:00"),
     ("memory",    "🧠 Memory     — persistent facts the assistant remembers"),
     ("weather",   "🌤 Weather    — /weather [city], setdefault"),
     ("search",    "🔍 Search     — web search via DuckDuckGo"),
@@ -1319,10 +1364,17 @@ async def briefing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     args  = context.args
     which = args[0].lower() if args else ""
     if which not in ("today", "tomorrow"):
-        await update.message.reply_text("Usage:\n  /briefing today\n  /briefing tomorrow")
+        await update.message.reply_text(
+            "Usage:\n"
+            "  /briefing today    — morning format (weather + today's events/tasks/reminders)\n"
+            "  /briefing tomorrow — evening format (today's wins + tomorrow preview)"
+        )
         return
     await update.message.reply_text("Fetching…")
-    await _send_briefing(context.bot, which, chat_id=update.effective_chat.id)
+    if which == "tomorrow":
+        await _send_evening_briefing(context.bot, chat_id=update.effective_chat.id)
+    else:
+        await _send_briefing(context.bot, "today", chat_id=update.effective_chat.id)
 
 
 async def digest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

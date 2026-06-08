@@ -1309,48 +1309,213 @@ def run_agent(user_message: str, history: list | None = None,
 # Called directly by the scheduler — no LLM involved, no fabrication possible.
 # Uses the same tool functions and formatters as the normal agent path.
 
-def build_briefing(date_keyword: str, lang: str = "en") -> str:
+# ── Reminder helpers for briefings ───────────────────────────────────────────
+
+import datetime as _dt
+
+def _reminders_for_date(target_date: "date", chat_id: int | None = None) -> list[dict]:
+    """Return pending reminders whose local fire time falls on target_date."""
+    local_tz = _dt.datetime.now().astimezone().tzinfo
+    try:
+        pending = (
+            _reminders.get_pending_for_chat(chat_id)
+            if chat_id is not None
+            else _reminders.get_pending()
+        )
+    except Exception:
+        return []
+    result = []
+    for r in pending:
+        try:
+            fire_utc   = _dt.datetime.fromisoformat(r["fire_at"]).replace(
+                            tzinfo=_dt.timezone.utc)
+            fire_local = fire_utc.astimezone(local_tz)
+            if fire_local.date() == target_date:
+                result.append({**r, "_local_time": fire_local.strftime("%H:%M")})
+        except Exception:
+            pass
+    return result
+
+
+def _fmt_reminders_section(reminders: list[dict], label: str = "⏰ Reminders") -> str:
+    if not reminders:
+        return f"{label}\n  None"
+    lines = [label]
+    for r in reminders:
+        t = r.get("_local_time", "")
+        msg = r.get("message", "")
+        lines.append(f"  • {t}  {msg}" if t else f"  • {msg}")
+    return "\n".join(lines)
+
+
+def _fmt_events_section(events: list[dict], label: str = "📅 Events") -> str:
+    if not events:
+        return f"{label}\n  None scheduled"
+    lines = [label]
+    for ev in events:
+        start = ev.get("start", "")
+        end   = ev.get("end", "")
+        time_str = f"{start}–{end}" if start and end else start
+        lines.append(f"  • {ev.get('title', '?')}  {time_str}".rstrip())
+    return "\n".join(lines)
+
+
+# ── Morning briefing (09:00 — "orient me for the day") ───────────────────────
+
+def build_briefing(date_keyword: str, lang: str = "en",
+                   chat_id: int | None = None) -> str:
     """
-    Fetch calendar, tasks, and (for morning briefings) weather for `date_keyword`.
-    Synchronous — safe to call from a ThreadPoolExecutor.
-    date_keyword: "today" | "tomorrow"
+    Morning briefing for date_keyword ("today" | "tomorrow").
+    Each section is isolated — a failure in one never blocks the rest.
     """
     today = date.today()
-    events = list_calendar_events(date_keyword)
-    tasks  = list_tasks()
-
-    cal_body  = _format_calendar_result(events, lang)
-    task_body = _format_tasks_result_proactive(tasks, lang)
+    target_date = today if date_keyword == "today" else today + _dt.timedelta(days=1)
 
     parts: list[str] = []
+    errors: list[str] = []
 
-    # Weather only in the morning (today) briefing
+    # ── Weather ───────────────────────────────────────────────────────────────
     if date_keyword == "today":
-        weather_block = _weather.get_weather(include_tomorrow=False)
-        parts.append(weather_block)
+        try:
+            parts.append(_weather.get_weather(include_tomorrow=False))
+        except Exception as exc:
+            errors.append(f"weather: {type(exc).__name__}")
+            parts.append("🌤 Weather\n  ⚠️ Could not load")
 
-    # Empty-day nudge: if no events today but there are overdue tasks, surface that
+    # ── Calendar events ───────────────────────────────────────────────────────
+    try:
+        events = list_calendar_events(date_keyword)
+        parts.append(_fmt_events_section(events, "📅 Today's events"
+                                         if date_keyword == "today"
+                                         else "📅 Tomorrow's events"))
+    except Exception as exc:
+        errors.append(f"calendar: {type(exc).__name__}")
+        parts.append("📅 Events\n  ⚠️ Could not load")
+        events = []
+
+    # ── Tasks (with overdue surfaced) ─────────────────────────────────────────
+    try:
+        tasks = list_tasks()
+        task_body = _format_tasks_result_proactive(tasks, lang)
+        label = "✅ Today's tasks" if date_keyword == "today" else "✅ Tomorrow's tasks"
+        parts.append(f"{label}\n\n{task_body}")
+    except Exception as exc:
+        errors.append(f"tasks: {type(exc).__name__}")
+        parts.append("✅ Tasks\n  ⚠️ Could not load")
+        tasks = []
+
+    # ── Reminders for the day ─────────────────────────────────────────────────
+    try:
+        todays_reminders = _reminders_for_date(target_date, chat_id)
+        label = "⏰ Today's reminders" if date_keyword == "today" else "⏰ Tomorrow's reminders"
+        parts.append(_fmt_reminders_section(todays_reminders, label))
+    except Exception as exc:
+        errors.append(f"reminders: {type(exc).__name__}")
+        parts.append("⏰ Reminders\n  ⚠️ Could not load")
+
+    # ── Empty-day nudge ───────────────────────────────────────────────────────
     if date_keyword == "today" and not events:
         overdue_count = sum(
             1 for t in tasks
             if t.get("due") and date.fromisoformat(t["due"][:10]) < today
         )
         if overdue_count:
-            nudge = (
+            parts.append(
                 f"💡 Nothing scheduled — good day to tackle "
                 f"{overdue_count} overdue task{'s' if overdue_count != 1 else ''}."
             )
-            parts.append(nudge)
 
-    if lang == "ru":
-        cal_label  = "📅 Календарь"
-        task_label = "✅ Задачи"
+    if errors:
+        parts.append(f"⚠️ Partial load — failed sections: {', '.join(errors)}")
+
+    return "\n\n".join(parts)
+
+
+# ── Evening briefing (23:00 — "wrap up + prep tomorrow") ─────────────────────
+
+def build_evening_briefing(chat_id: int | None = None) -> str:
+    """
+    Evening briefing: today's accomplishments + full tomorrow preview.
+    Each section is isolated — failures are noted, not fatal.
+    """
+    from tools import list_completed_today
+
+    today    = date.today()
+    tomorrow = today + _dt.timedelta(days=1)
+    header   = f"🌙 Evening briefing — {today.strftime('%A, %B')} {today.day}"
+
+    parts: list[str] = [header]
+    errors: list[str] = []
+
+    # ── 1. Today's accomplishments ────────────────────────────────────────────
+    try:
+        done = list_completed_today()
+    except Exception as exc:
+        done = None
+        errors.append(f"completed tasks: {type(exc).__name__}")
+
+    try:
+        past_events = list_calendar_events("today")
+    except Exception as exc:
+        past_events = None
+        errors.append(f"today's events: {type(exc).__name__}")
+
+    acc_lines = ["✅ Today's accomplishments"]
+    if done is None:
+        acc_lines.append("  ⚠️ Could not load completed tasks")
+    elif done:
+        for t in done:
+            acc_lines.append(f"  • {t['title']}  ({t['list']})")
     else:
-        cal_label  = "📅 Calendar"
-        task_label = "✅ Tasks"
+        acc_lines.append("  No tasks marked complete today")
 
-    parts.append(f"{cal_label}\n\n{cal_body}")
-    parts.append(f"{task_label}\n\n{task_body}")
+    if past_events is None:
+        acc_lines.append("  ⚠️ Could not load today's events")
+    elif past_events:
+        for ev in past_events:
+            start    = ev.get("start", "")
+            end      = ev.get("end", "")
+            time_str = f"{start}–{end}" if start and end else start
+            acc_lines.append(f"  📅 {ev.get('title', '?')}  {time_str}".rstrip())
+    parts.append("\n".join(acc_lines))
+
+    # ── 2. Tomorrow's events ──────────────────────────────────────────────────
+    try:
+        tmr_events = list_calendar_events("tomorrow")
+        parts.append(_fmt_events_section(tmr_events, "📅 Tomorrow's events"))
+    except Exception as exc:
+        errors.append(f"tomorrow's events: {type(exc).__name__}")
+        parts.append("📅 Tomorrow's events\n  ⚠️ Could not load")
+
+    # ── 3. Tomorrow's tasks ───────────────────────────────────────────────────
+    try:
+        tmr_tasks = list_tasks()
+        parts.append(f"✅ Tomorrow's tasks\n\n{_format_tasks_result_proactive(tmr_tasks)}")
+    except Exception as exc:
+        errors.append(f"tasks: {type(exc).__name__}")
+        parts.append("✅ Tomorrow's tasks\n  ⚠️ Could not load")
+
+    # ── 4. Tomorrow's reminders ───────────────────────────────────────────────
+    try:
+        tmr_reminders = _reminders_for_date(tomorrow, chat_id)
+        parts.append(_fmt_reminders_section(tmr_reminders, "⏰ Tomorrow's reminders"))
+    except Exception as exc:
+        errors.append(f"reminders: {type(exc).__name__}")
+        parts.append("⏰ Tomorrow's reminders\n  ⚠️ Could not load")
+
+    # ── 5. Tomorrow's weather forecast ────────────────────────────────────────
+    try:
+        wx_block  = _weather.get_weather(include_tomorrow=True)
+        tmr_lines = [l for l in wx_block.splitlines()
+                     if "Tomorrow" in l or "tomorrow" in l]
+        forecast  = "  ".join(tmr_lines) if tmr_lines else wx_block.splitlines()[-1]
+        parts.append(f"🌤 Tomorrow's forecast\n  {forecast}")
+    except Exception as exc:
+        errors.append(f"weather: {type(exc).__name__}")
+        parts.append("🌤 Tomorrow's forecast\n  ⚠️ Could not load")
+
+    if errors:
+        parts.append(f"⚠️ Partial load — failed sections: {', '.join(errors)}")
 
     return "\n\n".join(parts)
 
@@ -1359,16 +1524,11 @@ def build_digest() -> str:
     """
     Build the evening accomplishment digest for today.
     Synchronous — safe to call from a ThreadPoolExecutor.
+    Kept for the /digest on-demand command.
     """
     from tools import list_completed_today, list_calendar_events
 
-    today       = date.today()
-    label_date  = today.strftime("%A, %B %-d") if hasattr(today, "strftime") else today.isoformat()
-    try:
-        label_date = today.strftime("%A, %B {d}").replace("{d}", str(today.day))
-    except Exception:
-        label_date = today.isoformat()
-
+    today  = date.today()
     header = f"🌙 Evening digest — {today.strftime('%A, %B')} {today.day}"
     parts  = [header]
 
@@ -1379,12 +1539,12 @@ def build_digest() -> str:
         done = []
 
     if done:
-        lines = ["✅ *Tasks completed today:*"]
+        lines = ["✅ Tasks completed today"]
         for t in done:
             lines.append(f"  • {t['title']}  ({t['list']})")
         parts.append("\n".join(lines))
     else:
-        parts.append("✅ No tasks marked complete today.")
+        parts.append("✅ No tasks marked complete today")
 
     # ── Past events ───────────────────────────────────────────────────────────
     try:
@@ -1393,7 +1553,7 @@ def build_digest() -> str:
         events = []
 
     if events:
-        lines = ["📅 *Events today:*"]
+        lines = ["📅 Events today"]
         for ev in events:
             start = ev.get("start", "")
             end   = ev.get("end", "")
@@ -1401,15 +1561,6 @@ def build_digest() -> str:
             lines.append(f"  • {ev.get('title', '?')}  {time_str}".rstrip())
         parts.append("\n".join(lines))
     else:
-        parts.append("📅 No calendar events today.")
-
-    # ── Closing nudge ─────────────────────────────────────────────────────────
-    n_done = len(done)
-    if n_done >= 5:
-        parts.append("🔥 Great day — lots got done!")
-    elif n_done >= 1:
-        parts.append("👍 Good work today.")
-    else:
-        parts.append("Tomorrow is a fresh start. 💪")
+        parts.append("📅 No calendar events today")
 
     return "\n\n".join(parts)
