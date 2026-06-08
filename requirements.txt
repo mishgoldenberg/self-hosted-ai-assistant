@@ -1,0 +1,22 @@
+# Core bot
+python-telegram-bot==22.7
+
+# Google APIs
+google-api-python-client==2.197.0
+google-auth==2.53.0
+google-auth-httplib2==0.4.0
+google-auth-oauthlib==1.4.0
+
+# LLM client (Ollama OpenAI-compatible API)
+openai==2.41.0
+
+# Voice transcription (runs on CPU — no GPU required)
+faster-whisper==1.2.1
+ctranslate2==4.8.0
+
+# Web search
+duckduckgo_search==8.1.1
+
+# HTTP (transitive, pinned for reproducibility)
+requests==2.34.2
+requests-oauthlib==2.0.0
