@@ -247,9 +247,12 @@ TOOLS = [
         "function": {
             "name": "list_tasks",
             "description": (
-                "List open (incomplete) tasks from Google Tasks. "
-                "Without list_name, returns tasks from ALL lists. "
-                "Available lists: 'Work', 'Uni', 'Gym', 'Driving', or omit for the primary list."
+                "READ / LIST open (incomplete) tasks from Google Tasks. "
+                "Call this whenever the user wants to SEE, VIEW, CHECK, or SHOW tasks — "
+                "including 'what are my tasks', 'tasks for 8.6', 'show tasks due today'. "
+                "NEVER call create_task for a read/list/show request. "
+                "Without list_name returns tasks from ALL lists. "
+                "Use due_date to filter by a specific day."
             ),
             "parameters": {
                 "type": "object",
@@ -257,8 +260,16 @@ TOOLS = [
                     "list_name": {
                         "type": "string",
                         "description": (
-                            "Optional. One of: 'Work', 'Uni', 'Gym', 'Driving'. "
-                            "Omit to get tasks from all lists (including the primary list)."
+                            "Optional. Filter by task list name. "
+                            "Omit to get tasks from all lists."
+                        ),
+                    },
+                    "due_date": {
+                        "type": "string",
+                        "description": (
+                            "Optional. ISO date 'YYYY-MM-DD'. "
+                            "Return only tasks due on this exact date. "
+                            "Convert DD.MM dates before passing: 8.6 → 2026-06-08."
                         ),
                     },
                 },
@@ -613,12 +624,93 @@ print(f"[agent] formatter=ON  rail=ON  model={MODEL}", flush=True)
 # keyed by chat_id (int).  Cleared once the confirmed delete executes.
 _pending_deletes: dict[int, dict] = {}
 
+# ── Pending-reschedule registry ───────────────────────────────────────────────
+# When a "move all tasks from X to Y" query is detected, Python lists tasks,
+# shows a confirmation, and stores what to execute here.
+# {chat_id: {"tasks": [...], "from_date": "YYYY-MM-DD", "to_date": "YYYY-MM-DD"}}
+_pending_reschedules: dict[int, dict] = {}
+
 # ── Button-payload side-channel ───────────────────────────────────────────────
 # run_agent populates this after a short-circuit so telegram_bot.py can attach
 # inline buttons without the agent having to know about Telegram internals.
 # Structure: { chat_id: {"type": "tasks"|"events"|"created_task"|"created_event",
 #                        "data": <list[dict] | dict>} }
 _button_payloads: dict[int, dict] = {}
+
+
+# ── Language guard helpers ────────────────────────────────────────────────────
+
+def _contains_cjk(text: str) -> bool:
+    """True if text contains CJK (Chinese/Japanese/Korean) characters."""
+    return any("一" <= ch <= "鿿" or
+               "぀" <= ch <= "ヿ" or
+               "가" <= ch <= "힣" for ch in text)
+
+def _wrong_language(text: str, expected_lang: str) -> bool:
+    """True if text is clearly in the wrong language for expected_lang."""
+    if _contains_cjk(text):
+        return True  # always wrong, CJK should never appear
+    cyrillic_count = sum(1 for ch in text if "Ѐ" <= ch <= "ӿ")
+    latin_count    = sum(1 for ch in text if "A" <= ch <= "z")
+    if expected_lang == "en" and cyrillic_count > max(20, len(text) * 0.3):
+        return True   # English reply is mostly Cyrillic
+    if expected_lang == "ru" and _contains_cjk(text):
+        return True
+    return False
+
+_AFFIRMATIVE_RE = re.compile(
+    r'^(yes|да|yep|sure|ok|ок|okay|подтверд|перенос|move|go\s+ahead|'
+    r'confirm|конечно|давай|do\s+it|do it)\s*[.!]*$',
+    re.IGNORECASE | re.UNICODE,
+)
+
+def _is_affirmative(text: str) -> bool:
+    return bool(_AFFIRMATIVE_RE.match(text.strip()))
+
+
+# ── Reschedule helpers ────────────────────────────────────────────────────────
+
+_RESCHEDULE_DATES_RE = re.compile(
+    r'(?:move|reschedule|shift|перенеси|перенести|сдвинь)\s+.*?'
+    r'(?:from|с|со|из)\s+(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?|\d{4}-\d{2}-\d{2})\s+'
+    r'(?:to|на|до|в)\s+(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?|\d{4}-\d{2}-\d{2})',
+    re.IGNORECASE | re.UNICODE,
+)
+
+def _parse_dd_mm(s: str) -> str | None:
+    """Parse 'D.M', 'D/M', 'D.M.YYYY' into 'YYYY-MM-DD'. Returns None on failure."""
+    import datetime as _dt2
+    s = s.strip()
+    if re.match(r'^\d{4}-\d{2}-\d{2}$', s):
+        return s
+    m = re.match(r'^(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?$', s)
+    if not m:
+        return None
+    day, month = int(m.group(1)), int(m.group(2))
+    year = int(m.group(3)) if m.group(3) else _dt2.date.today().year
+    if year < 100:
+        year += 2000
+    try:
+        return _dt2.date(year, month, day).isoformat()
+    except ValueError:
+        return None
+
+def _format_reschedule_preview(tasks: list[dict], from_date: str, to_date: str,
+                                lang: str = "en") -> str:
+    """Return a confirmation prompt listing what will be moved."""
+    from_label = from_date[5:].replace("-", "/")  # "06/08"
+    to_label   = to_date[5:].replace("-", "/")
+    n = len(tasks)
+    if lang == "ru":
+        header = f"Перенести {n} задач{'у' if n==1 else 'и' if n<5 else ''} с {from_label} на {to_label}?"
+    else:
+        header = f"Move {n} task{'s' if n!=1 else ''} from {from_label} to {to_label}?"
+    lines = [header, ""]
+    for t in tasks:
+        lines.append(f"  • {t['title']}  ({t['list']})")
+    lines.append("")
+    lines.append("Да / Yes  или  Нет / No" if lang == "ru" else "Reply yes to confirm, no to cancel.")
+    return "\n".join(lines)
 
 
 # ── Calendar result formatter ─────────────────────────────────────────────────
@@ -864,13 +956,40 @@ _LIST_QUERY_RE = re.compile(
     r'what.s on|what do i have|what.s my|show me|show my|'
     r'что (у меня|на|запланировано|стоит|есть)|покаж|список|'
     # "my list" / "my tasks" / "my schedule" — catches "what's on my list"
-    r'my list|my tasks|my events|my schedule',
+    r'my list|my tasks|my events|my schedule|'
+    # Date-qualified task/show phrases: "tasks for 8.6", "задачи на 8.6"
+    r'tasks? (for|on|due)|задачи (на|за|от)|'
+    r'(for|on|for)\s+\d{1,2}[./]\d{1,2}',
     re.IGNORECASE | re.UNICODE,
 )
 
+_CREATE_QUERY_RE = re.compile(
+    r'\b(add|create|new|make|set up|put|schedule|добавь|создай|поставь|запиши|'
+    r'напомни\s+мне|remind\s+me\s+to)\b',
+    re.IGNORECASE | re.UNICODE,
+)
+
+_RESCHEDULE_RE = re.compile(
+    r'\b(move|reschedule|shift|перенеси|перенести|сдвинь)\b.{0,40}'
+    r'(tasks?|задач)',
+    re.IGNORECASE | re.UNICODE,
+)
+
+def _is_reschedule_query(text: str) -> bool:
+    """True when the user wants to move/reschedule a set of tasks."""
+    return bool(_RESCHEDULE_RE.search(text))
+
 def _is_list_query(text: str) -> bool:
-    """True when the message is asking to list tasks or calendar data."""
-    return bool(_LIST_QUERY_RE.search(text))
+    """True when the message is asking to read/list tasks or calendar data."""
+    if not _LIST_QUERY_RE.search(text):
+        return False
+    # "add a task", "create task ..." are create-intent, not list-intent
+    # — but "add task" without a noun after isn't create if there's a show/list word
+    show_words = re.search(r'\b(show|list|what|display|покаж|список|что|какие)\b',
+                           text, re.IGNORECASE | re.UNICODE)
+    if _CREATE_QUERY_RE.search(text) and not show_words:
+        return False
+    return True
 
 
 # ── Conversational-turn detector ──────────────────────────────────────────────
@@ -938,6 +1057,73 @@ def run_agent(user_message: str, history: list | None = None,
         history:      Prior conversation turns (list of message dicts).
         chat_id:      Telegram chat ID — used for the confirmation rail on deletes.
     """
+    lang = "ru" if _is_russian(user_message) else "en"
+
+    # ── Reschedule confirmation: pending state + user said "yes" ──────────────
+    if chat_id is not None and _is_affirmative(user_message):
+        pending_rs = _pending_reschedules.pop(chat_id, None)
+        if pending_rs:
+            tasks     = pending_rs["tasks"]
+            to_date   = pending_rs["to_date"]
+            from_date = pending_rs["from_date"]
+            updated, failed = [], []
+            for t in tasks:
+                try:
+                    from tools import update_task as _update_task
+                    _update_task(task_title=t["title"],
+                                 list_name=t["list"],
+                                 due_date=to_date)
+                    updated.append(t["title"])
+                except Exception as exc:
+                    failed.append(f"{t['title']} ({exc})")
+            from_label = from_date[5:].replace("-", "/")
+            to_label   = to_date[5:].replace("-", "/")
+            if lang == "ru":
+                lines = [f"✅ Перенесено с {from_label} на {to_label}:"]
+                for title in updated:
+                    lines.append(f"  • {title}")
+                if failed:
+                    lines.append(f"\n⚠️ Не удалось перенести:")
+                    for f in failed:
+                        lines.append(f"  • {f}")
+            else:
+                lines = [f"✅ Moved from {from_label} to {to_label}:"]
+                for title in updated:
+                    lines.append(f"  • {title}")
+                if failed:
+                    lines.append(f"\n⚠️ Failed to move:")
+                    for f in failed:
+                        lines.append(f"  • {f}")
+            return "\n".join(lines)
+
+    # ── Reschedule detection: list tasks + show confirmation ──────────────────
+    if _is_reschedule_query(user_message) and chat_id is not None:
+        m = _RESCHEDULE_DATES_RE.search(user_message)
+        if m:
+            from_iso = _parse_dd_mm(m.group(1))
+            to_iso   = _parse_dd_mm(m.group(2))
+            if from_iso and to_iso:
+                try:
+                    tasks = list_tasks(due_date=from_iso)
+                except Exception as exc:
+                    return (f"⚠️ Не удалось получить задачи: {exc}"
+                            if lang == "ru"
+                            else f"⚠️ Couldn't fetch tasks: {exc}")
+                if not tasks:
+                    from_label = from_iso[5:].replace("-", "/")
+                    return (f"Задач на {from_label} нет."
+                            if lang == "ru"
+                            else f"No tasks due on {from_iso[5:].replace('-', '/')}.")
+                _pending_reschedules[chat_id] = {
+                    "tasks": tasks,
+                    "from_date": from_iso,
+                    "to_date": to_iso,
+                }
+                preview = _format_reschedule_preview(tasks, from_iso, to_iso, lang)
+                print(f"  [RESCHEDULE-RAIL] Stored pending reschedule "
+                      f"(chat={chat_id}, {from_iso}→{to_iso}, {len(tasks)} tasks)")
+                return preview
+
     # Build chat_id-aware set_reminder and inject it for this call
     def _set_reminder_for_chat(message: str, fire_at: str) -> dict:
         if chat_id is None:
@@ -995,17 +1181,20 @@ def run_agent(user_message: str, history: list | None = None,
             "  If the user already told you which they want (e.g. after an ask_clarification), "
             "honour that choice immediately.\n\n"
 
-            "TASKS — ADDITIONAL RULES:\n"
-            "• The user's task lists are determined by their Google account (fetched live).\n"
-            "• When the user says 'My Tasks', 'my list', or doesn't specify a list → omit list_name "
-            "(use the primary list).\n"
-            "• NEVER invent a list name. If the user mentions a list that doesn't exist, tell them "
-            "the available lists and ask which one to use.\n"
-            "• Tasks API CANNOT store a time. When the user specifies a time for a task "
-            "(e.g. 'task tomorrow at 15:00'), use due_datetime — this sets the task due date "
-            "to that day AND creates a Calendar event at that time. Report both to the user.\n"
-            "• For date-only tasks (no time mentioned), use due_date.\n"
-            "• To update an existing task's date/time/title, call update_task, not create_task.\n\n"
+            "TASKS — ROUTING RULES (follow strictly):\n"
+            "• READ intent ('what are my tasks', 'tasks for 8.6', 'show tasks', 'задачи на 8.6', "
+            "'что у меня', 'покажи задачи') → call list_tasks. NEVER call create_task for read requests.\n"
+            "• CREATE intent ('add a task', 'create task', 'remind me to', 'добавь задачу') → "
+            "call create_task.\n"
+            "• RESCHEDULE-A-DAY ('move all tasks from DATE1 to DATE2', 'перенеси задачи с X на Y') → "
+            "call list_tasks with due_date=DATE1 first to get the list, then show the user what "
+            "will be moved and ask to confirm ('Move these N tasks from DATE1 to DATE2?'), "
+            "then call update_task for each one with due_date=DATE2.\n"
+            "• To update an existing task's date/time/title, call update_task, not create_task.\n"
+            "• NEVER invent a list name — if unknown, tell the user and ask.\n"
+            "• Tasks API CANNOT store a time. When the user specifies a time, use due_datetime "
+            "(sets task due date AND creates a Calendar event at that time). Report both.\n"
+            "• For date-only tasks, use due_date. Convert DD.MM to YYYY-MM-DD before passing.\n\n"
 
             "CALENDAR REMINDERS:\n"
             "• When creating an event: if the user says 'remind me X before', set reminder_minutes "
@@ -1031,8 +1220,12 @@ def run_agent(user_message: str, history: list | None = None,
 
             "WEB SEARCH: For any question requiring current events, facts, definitions, prices, "
             "news, or information not in the user's calendar/tasks, call web_search. "
-            "Never answer from training data alone for time-sensitive questions. "
-            "Always cite the source URLs from the results.\n\n"
+            "Never answer from training data alone for time-sensitive questions.\n"
+            "AFTER calling web_search: synthesize a direct answer from the returned snippets. "
+            "Example: 'Portugal plays DR Congo on June 17 and Uzbekistan on June 23 (source: fifa.com).' "
+            "DO NOT dump a list of URLs or say 'here are some sources'. "
+            "If the snippets don't contain a clear answer, say so plainly and include 1-2 URLs "
+            "the user can check themselves — but only as a fallback.\n\n"
 
             "MEMORY: When the user says 'remember', 'note that', 'always X', or 'my preference is', "
             "call save_memory with the fact. Never store secrets or passwords.\n\n"
@@ -1048,7 +1241,10 @@ def run_agent(user_message: str, history: list | None = None,
             "absolute ISO 8601 datetimes using today's date and the user's local timezone. "
             "Confirm back with the exact time you scheduled.\n\n"
 
-            "LANGUAGE: Reply in the language the user wrote in. Russian → Russian. English → English."
+            "LANGUAGE: Reply ONLY in the language the user wrote in. Russian → Russian. English → English. "
+            "NEVER use Chinese, Japanese, or any other language regardless of training data defaults. "
+            "This rule applies to ALL messages including errors, clarifications, and confirmations. "
+            "If uncertain, default to English — never to Chinese."
             + memory_block
         ),
     }
@@ -1056,7 +1252,6 @@ def run_agent(user_message: str, history: list | None = None,
     messages = [system] + (history or []) + [{"role": "user", "content": user_message}]
 
     MAX_TOOL_ROUNDS = 10
-    lang = "ru" if _is_russian(user_message) else "en"
 
     for round_num in range(MAX_TOOL_ROUNDS):
 
@@ -1155,6 +1350,44 @@ def run_agent(user_message: str, history: list | None = None,
         # No tool calls → model gave a final conversational answer.
         if not assistant_msg.tool_calls:
             final = assistant_msg.content or "(no response)"
+
+            # ── Language guard ────────────────────────────────────────────────
+            # qwen2.5:7b can drift into Chinese (when confused) or Russian
+            # (when search results have Russian sources) for English queries.
+            # Detect wrong language and retry once with explicit instruction.
+            if _wrong_language(final, lang):
+                lang_name = "Russian" if lang == "ru" else "English"
+                print(f"  [CJK-GUARD] Chinese characters detected in reply "
+                      f"— retrying with explicit {lang_name} instruction")
+                lang_messages = messages + [{
+                    "role": "user",
+                    "content": (
+                        f"IMPORTANT: Reply ONLY in {lang_name}. "
+                        f"Never use Chinese or any other language. "
+                        f"Restate your previous answer in {lang_name} now."
+                    ),
+                }]
+                try:
+                    retry_resp = client.chat.completions.create(
+                        model=MODEL,
+                        messages=lang_messages,
+                        tools=TOOLS,
+                        tool_choice="none",
+                    )
+                    retry_final = retry_resp.choices[0].message.content or ""
+                    if retry_final and not _wrong_language(retry_final, lang):
+                        final = retry_final
+                    else:
+                        # Still wrong — return safe fallback in correct language
+                        final = ("Не удалось получить ответ — попробуйте ещё раз."
+                                 if lang == "ru"
+                                 else "Couldn't generate a response — please try again.")
+                except Exception as exc:
+                    print(f"  [CJK-GUARD] Retry failed: {exc}")
+                    final = ("Не удалось получить ответ — попробуйте ещё раз."
+                             if lang == "ru"
+                             else "Couldn't generate a response — please try again.")
+
             print("  " + "═" * 70)
             print(f"  [final reply to user]:\n{final}")
             print("  " + "═" * 70)
@@ -1189,6 +1422,24 @@ def run_agent(user_message: str, history: list | None = None,
                               f"(chat={chat_id}, title={pending.get('title')!r}) "
                               f"— allowing delete, clearing pending")
                         _pending_deletes.pop(chat_id, None)
+
+                # ── Read-intent guard ─────────────────────────────────────
+                # If the model calls create_task with no title on a list-intent
+                # message, it misrouted. Silently redirect to list_tasks so
+                # the user always gets their list, not an error.
+                if (fn_name == "create_task"
+                        and "title" not in args
+                        and _is_list_query(user_message)):
+                    print(f"  [READ-GUARD] create_task(no title) on list query "
+                          f"— redirecting to list_tasks(due_date={args.get('due_date')!r})")
+                    fn_name = "list_tasks"
+                    redirect_args: dict = {}
+                    if args.get("due_date"):
+                        redirect_args["due_date"] = args["due_date"]
+                    if args.get("list_name"):
+                        redirect_args["list_name"] = args["list_name"]
+                    args = redirect_args
+                    # Update the tool_call id tracking entry (executed list rebuilt below)
 
                 fn = TOOL_FUNCTIONS.get(fn_name)
                 if fn is None:
@@ -1250,9 +1501,12 @@ def run_agent(user_message: str, history: list | None = None,
         all_success = all(isinstance(res, list) for _, _, res, _ in executed)
 
         # Only short-circuit when the user actually asked for a list.
-        # Without this gate, a listing tool forced on a non-list query (e.g.
-        # "yes" or "thanks") would surface an unsolicited task/event list.
-        if all_listing and all_success and _is_list_query(user_message):
+        # Reschedule queries use list_tasks as the first step but then need
+        # the model to propose a confirmation + call update_task — don't
+        # short-circuit those or the model never gets to do the update.
+        if (all_listing and all_success
+                and _is_list_query(user_message)
+                and not _is_reschedule_query(user_message)):
             parts = [_python_format_listing(fn, res, lang)
                      for fn, _, res, _ in executed]
             final = "\n\n".join(parts)
@@ -1293,7 +1547,29 @@ def run_agent(user_message: str, history: list | None = None,
 
         # ── Fall-through: non-listing or error — let the model respond ─────────
         for fn_name, args, result, tc_id in executed:
-            content = json.dumps(result, default=str)
+            # For web_search, convert raw JSON into readable text so the model
+            # synthesizes an answer from content — not from a list of URLs.
+            if fn_name == "web_search" and isinstance(result, dict):
+                hits = result.get("results", [])
+                if hits:
+                    lines = [
+                        "SEARCH RESULTS — synthesize a direct answer from these snippets. "
+                        "DO NOT list URLs as your answer. Cite sources inline.\n"
+                    ]
+                    for i, h in enumerate(hits, 1):
+                        lines.append(
+                            f"[{i}] {h.get('title', '')}\n"
+                            f"    URL: {h.get('url', '')}\n"
+                            f"    {h.get('snippet', '')}"
+                        )
+                    content = "\n".join(lines)
+                elif result.get("error"):
+                    content = f"Search failed: {result['error']}"
+                else:
+                    content = "No search results found."
+            else:
+                content = json.dumps(result, default=str)
+
             print(f"  [tool round {round_num+1}] →MODEL:\n{content}")
             print("  " + "─" * 70)
             messages.append({

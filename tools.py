@@ -637,16 +637,19 @@ def delete_calendar_event(title: str, date_str: str,
 # TASKS FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def list_tasks(list_name: str | None = None) -> list[dict]:
+def list_tasks(list_name: str | None = None,
+               due_date: str | None = None) -> list[dict]:
     """
     Return all open (incomplete) tasks.
 
     Args:
         list_name: If given, only tasks from that list. Omit for all lists.
                    "My Tasks" / "Мои задачи" → primary list.
+        due_date:  ISO date "YYYY-MM-DD". If given, return only tasks whose
+                   due date matches exactly. Filtered in Python after fetch.
 
     Returns:
-        List of {title, due, due_is_timed, list} dicts.
+        List of {title, due, list} dicts.
     """
     _, tasks_svc = _get_services()
 
@@ -670,6 +673,12 @@ def list_tasks(list_name: str | None = None) -> list[dict]:
                 "list":    ltitle,
                 "list_id": lid,
             })
+
+    if due_date:
+        # Normalise: accept "YYYY-MM-DD", strip anything longer
+        target = due_date[:10]
+        out = [t for t in out if t.get("due") == target]
+
     return out
 
 
