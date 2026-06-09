@@ -87,7 +87,10 @@ def _fetch_messages(msg_ids: list[str]) -> list[dict]:
 
         hdrs    = _extract_headers(msg.get("payload", {}).get("headers", []))
         subject = hdrs.get("subject", "(no subject)")
-        sender  = hdrs.get("from", "(unknown)")
+        raw_from = hdrs.get("from", "(unknown)")
+        # Show "Name" when available, fall back to email address
+        name_match = re.match(r'^"?([^"<]+?)"?\s*<', raw_from)
+        sender = name_match.group(1).strip() if name_match else raw_from
         date    = _parse_date(hdrs.get("date", ""))
         snippet = msg.get("snippet", "")
 
@@ -112,9 +115,13 @@ def summarize_unread(max_messages: int = 10) -> list[dict]:
     Never fabricates — every field comes directly from the Gmail API.
     """
     svc = _get_gmail()
+    # "category:primary" matches exactly the Gmail Primary tab.
+    # labelIds=INBOX is a hard filter; the q= scopes to Primary and excludes
+    # Promotions, Social, Updates, Spam, and Trash.
     resp = svc.users().messages().list(
         userId="me",
-        labelIds=["INBOX", "UNREAD", "CATEGORY_PERSONAL"],  # Primary tab only — excludes Spam/Trash/Promotions/Social/Updates
+        labelIds=["INBOX", "UNREAD"],
+        q="category:primary",
         maxResults=min(max_messages, 25),
     ).execute()
     ids = [m["id"] for m in resp.get("messages", [])]

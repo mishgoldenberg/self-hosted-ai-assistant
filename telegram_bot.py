@@ -1732,43 +1732,29 @@ def _format_inbox(messages: list[dict]) -> str:
     """Deterministic formatter — never calls LLM, all content from API."""
     from html import escape as _e
     if not messages:
-        return "📭 No unread messages in your inbox."
+        return "📭 No unread messages in Primary."
 
-    urgent   = [m for m in messages if m.get("is_urgent")]
-    normal   = [m for m in messages if not m.get("is_urgent")]
-    lines: list[str] = [f"📬 <b>Inbox — {len(messages)} unread</b>"]
+    n = len(messages)
+    lines: list[str] = [f"📥 <b>{n} unread in Primary</b>"]
 
-    if urgent:
+    for m in messages:
         lines.append("")
-        lines.append("🔴 <b>Flagged as urgent:</b>")
-        for m in urgent:
-            if "error" in m:
-                lines.append(f"   ⚠️ {_e(m['error'])}")
-                continue
-            sender  = _e(m.get("sender", "?"))
-            subject = _e(m.get("subject", "(no subject)"))
-            date    = _e(m.get("date", ""))
-            snippet = _e(m.get("snippet", "")[:120])
-            lines.append(f"   • <b>{subject}</b>")
-            lines.append(f"     From: {sender}  [{date}]")
-            if snippet:
-                lines.append(f"     {snippet}")
+        if "error" in m:
+            lines.append(f"⚠️ {_e(str(m['error']))}")
+            continue
 
-    if normal:
-        lines.append("")
-        lines.append("📩 <b>Other unread:</b>")
-        for m in normal:
-            if "error" in m:
-                lines.append(f"   ⚠️ {_e(m['error'])}")
-                continue
-            sender  = _e(m.get("sender", "?"))
-            subject = _e(m.get("subject", "(no subject)"))
-            date    = _e(m.get("date", ""))
-            snippet = _e(m.get("snippet", "")[:100])
-            lines.append(f"   • <b>{subject}</b>  [{date}]")
-            lines.append(f"     {sender}")
-            if snippet:
-                lines.append(f"     {snippet}")
+        urgent  = m.get("is_urgent", False)
+        sender  = _e(m.get("sender",  "?"))
+        subject = _e(m.get("subject", "(no subject)"))
+        date    = _e(m.get("date",    ""))
+        raw_snip = m.get("snippet", "")
+        preview = _e(raw_snip[:60] + ("…" if len(raw_snip) > 60 else ""))
+
+        flag = "🔴 " if urgent else ""
+        lines.append(f"{flag}<b>{sender}</b>  <i>{date}</i>")
+        lines.append(f"{subject}")
+        if preview:
+            lines.append(f"<i>{preview}</i>")
 
     return "\n".join(lines)
 
