@@ -114,7 +114,7 @@ def summarize_unread(max_messages: int = 10) -> list[dict]:
     svc = _get_gmail()
     resp = svc.users().messages().list(
         userId="me",
-        q="is:unread in:inbox",
+        labelIds=["INBOX", "UNREAD"],   # hard label filter — excludes Spam/Trash/All Mail
         maxResults=min(max_messages, 25),
     ).execute()
     ids = [m["id"] for m in resp.get("messages", [])]
